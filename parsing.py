@@ -1,5 +1,4 @@
-import re
-
+import openai
 import requests
 import logging
 import pandas as pd
@@ -26,6 +25,8 @@ chrome_options.add_argument('--disable-gpu')
 
 driver = webdriver.Chrome(options=chrome_options)
 
+openai.api_key = 'KEY'
+
 
 def fetch_page(url, headers):
     """Загружает страницу и возвращает HTML-контент."""
@@ -37,12 +38,44 @@ def fetch_page(url, headers):
         logging.error(f"Ошибка при запросе {url}: {e}")
         return None
 
-def safe_get_text(element, tag, class_=None, default=""):
-    found = element.find(tag, class_=class_)
-    return found.get_text(strip=True) if found else default
 
-def get_text_or_none(element):
-    return element.get_text(strip=True) if element else 'N/A'
+def extract_data(
+        soup,
+        tag=None,
+        class_=None,
+        text=None,
+        attribute=None,
+        find_next=False,
+        default="No data",
+        element=None
+):
+    """
+    Универсальная функция для извлечения данных из HTML.
+
+    :param soup: BeautifulSoup объект или HTML-элемент.
+    :param tag: Тег для поиска.
+    :param class_: Класс элемента.
+    :param text: Текст элемента.
+    :param attribute: Атрибут для извлечения (например, href).
+    :param find_next: Найти следующий элемент (например, span).
+    :param default: Значение по умолчанию, если элемент не найден.
+    :param element: Конкретный HTML-элемент (если уже найден ранее).
+    :return: Извлеченные данные или значение по умолчанию.
+    """
+    try:
+        # Если передан элемент, работаем с ним, иначе используем soup
+        search_area = element if element else soup
+        found = search_area.find(tag, class_=class_, text=text)
+
+        if find_next and found:
+            found = found.find_next('span')
+
+        if attribute and found:
+            return found[attribute]
+
+        return found.get_text(strip=True) if found else default
+    except Exception:
+        return default
 
 
 def save_to_csv(file_path, data, headers):
@@ -57,6 +90,7 @@ def save_to_csv(file_path, data, headers):
 
 
 def save_to_csv_without_duplicates(file_path, data):
+    """Сохраняет данные в файл в формате csv без повторений"""
     if not data:
         logging.warning("Нет данных для сохранения.")
         return
@@ -68,6 +102,7 @@ def save_to_csv_without_duplicates(file_path, data):
 
 
 def decode_spamspan(spamspan_element):
+    """Обрабатывает адреса электронной почты"""
     email_parts = spamspan_element.find_all('span')
     return ''.join(part.get_text(strip=True) for part in email_parts).replace('[at]', '@').replace('[dot]', '.')
 
@@ -87,6 +122,9 @@ def safe_find(soup, selector, attribute=None, text_only=False, separator=' ', st
         return element.text.strip() if element else ''
     except AttributeError:
         return ''
+
+def get_text_or_none(element):
+    return element.get_text(strip=True) if element else 'N/A'
 
 def parse_csv_file(file_path):
     """Функция для парсинга конкретных данных по линкам из файла (данные могут быть изменены)"""
@@ -183,6 +221,114 @@ def main():
         except Exception:
             pass
 
+def ask_openai(question, prompt_prefix=""):
+    """Задает вопрос OpenAI и возвращает ответ."""
+    prompt = f"{prompt_prefix}\n\nQuestion: {question}\nAnswer:"
+    try:
+        response = openai.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=4000,
+            temperature=1
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"Ошибка при обращении к OpenAI: {e}")
+        return "Error"
+
+
+def send_post_request(row):
+    """Отправляет POST-запрос на указанный URL с данными из строки файла."""
+    url = "https://beta.mirr.art/api/open_calls/"
+    headers = {
+        "Authorization": "KEY",
+        "Accept": "application/json"
+    }
+
+    data = {
+        "city_country": row['City_Country'],
+        "open_call_title": row['Open_Call_Title'],
+        "deadline_date": row['Deadline_Date'],
+        "event_date": row['Event_Date'],
+        "application_from_link": row['Application_Form_Link'],
+        "selection_criteria": row['Selection_Criteria'],
+        "faq": row['FAQ'],
+        "fee": row['Fee'],
+        "application_guide": row['Application_Guide'],
+        "open_call_description": f"Open call in {row['City_Country']} titled {row['Open_Call_Title']}."
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=data)
+        if response.status_code == 200:
+            logging.info(f"Успешно отправлены данные для Open Call: {row['Open_Call_Title']}")
+        else:
+            logging.error(f"Ошибка при отправке данных для Open Call: {row['Open_Call_Title']}. Статус код: {response.status_code}")
+    except Exception as e:
+        logging.error(f"Ошибка при отправке POST-запроса: {e}")
+
+def process_csv_and_send_requests(file_path):
+    """Читает CSV файл, обрабатывает данные и отправляет POST-запросы по каждой строке."""
+    try:
+        df = pd.read_csv(file_path)
+        print(f"Файл {file_path} успешно загружен.")
+    except Exception as e:
+        print(f"Ошибка при загрузке файла {file_path}: {e}")
+        return
+
+    for _, row in df.iterrows():
+        # Задать вопросы OpenAI и обработать строки
+        data = " ".join([f"{col}: {str(value)}" for col, value in row.items()])
+
+        city_country = ask_openai(f"Верни на английском языке ТОЛЬКО страну, если указано. Данные: {data}")
+        opencall_title = ask_openai(f"Верни на английском языке ТОЛЬКО название опен-колла. Данные: {data}")
+        deadline_date = ask_openai(f"Верни на английском языке ТОЛЬКО дату дедлайна в формате YYYY-MM-DD. Данные: {data}")
+        event_date = ask_openai(f"Верни на английском языке ТОЛЬКО дату мероприятия. Данные: {data}")
+        application_form_link = ask_openai(f"Верни на английском языке ТОЛЬКО ссылку на форму заявки. Данные: {data}")
+        selection_criteria = ask_openai(f"Верни на английском языке ТОЛЬКО критерии отбора. Данные: {data}")
+        fee = ask_openai(f"Верни на английском языке ТОЛЬКО стоимость участия. Данные: {data}")
+        faq = ask_openai(f"Составь FAQ для опен-колла. Данные: {data}")
+        application_guide = ask_openai(f"Составь подробный план подачи заявки. Данные: {data}")
+
+        # Сохранить данные в словарь
+        processed_data = {
+            'City_Country': city_country,
+            'Open_Call_Title': opencall_title,
+            'Deadline_Date': deadline_date,
+            'Event_Date': event_date,
+            'Application_Form_Link': application_form_link,
+            'Selection_Criteria': selection_criteria,
+            'FAQ': faq,
+            'Fee': fee,
+            'Application_Guide': application_guide
+        }
+
+        # Отправка данных на удаленный сервер
+        send_post_request(processed_data)
+
+def save_results(results, output_file):
+    """Сохраняет результаты в CSV файл."""
+    try:
+        df_results = pd.DataFrame(results)
+        df_results.to_csv(output_file, index=False, encoding='utf-8-sig')
+        print(f"Результаты успешно сохранены в {output_file}")
+    except Exception as e:
+        print(f"Ошибка при сохранении файла: {e}")
+
+def main_process(file_path):
+    """Основной процесс обработки CSV и отправки данных."""
+    try:
+        results = process_csv_and_send_requests(file_path)
+        if results:
+            save_results(results, '/content/drive/MyDrive/open_calls_ready_2/results.csv')
+        else:
+            print("Нет данных для сохранения.")
+    except Exception as e:
+        print(f"Ошибка в процессе выполнения: {e}")
+
 
 def parse_artist_opportunities(base_url, output_file):
     """Парсинг сайта https://www.artrabbit.com/artist-opportunities/"""
@@ -198,12 +344,12 @@ def parse_artist_opportunities(base_url, output_file):
         row = {
             'Data-d': artopp_element.get('data-d', ''),
             'Data-a': artopp_element.get('data-a', ''),
-            'Heading': safe_get_text(artopp_element, 'h3', 'b_categorical-heading mod--artopps'),
-            'Alert': safe_get_text(artopp_element, 'p', 'b_ending-alert mod--just-opened'),
-            'Title': safe_get_text(artopp_element, 'h2'),
-            'Date Updated': safe_get_text(artopp_element, 'p', 'b_date'),
-            'Body': safe_get_text(artopp_element, 'div', 'm_body-copy'),
-            'URL': artopp_element.find('a', class_='b_submit mod--next').get('href', '') if artopp_element.find('a', class_='b_submit mod--next') else ''
+            'Heading': extract_data(artopp_element, tag='h3', class_='b_categorical-heading mod--artopps'),
+            'Alert': extract_data(artopp_element, tag='p', class_='b_ending-alert mod--just-opened'),
+            'Title': extract_data(artopp_element, tag='h2'),
+            'Date Updated': extract_data(artopp_element, tag='p', class_='b_date'),
+            'Body': extract_data(artopp_element, tag='div', class_='m_body-copy'),
+            'URL': extract_data(artopp_element, tag='a', class_='b_submit mod--next', attribute='href', default='')
         }
         data.append(row)
 
@@ -225,11 +371,11 @@ def parse_transartists(base_url, output_file):
         rows = soup.find_all('tr')
 
         for row in rows:
-            date = safe_get_text(row, 'td', class_='views-field views-field-created')
+            date = extract_data(row, tag='td', class_='views-field views-field-created')
             content_td = row.find('td', class_='views-field views-field-field-your-ad')
 
             if content_td:
-                title = safe_get_text(content_td, 'h2')
+                title = extract_data(content_td, tag='h2')
                 description = ' '.join(p.get_text(strip=True) for p in content_td.find_all('p'))
                 email = decode_spamspan(content_td.find('a', class_='spamspan')) if content_td.find('a', class_='spamspan') else ''
                 website = content_td.find('a', href=lambda href: href and "http" in href).get('href') if content_td.find('a', href=lambda href: href and "http" in href) else ''
@@ -246,111 +392,71 @@ def parse_transartists(base_url, output_file):
     logging.info("Saved Transartist opportunities to %s", output_file)
 
 
-
 def parse_resartis_opportunities(base_url, output_file):
     """Парсинг сайта https://resartis.org/open-calls/"""
     driver.get(base_url)
 
     try:
-        # Ждём, пока элемент с классом 'grid__item postcard' появится
         WebDriverWait(driver, 10).until(
             EC.presence_of_all_elements_located((By.CLASS_NAME, 'grid__item'))
         )
         html = driver.page_source
         soup = BeautifulSoup(html, 'html.parser')
-
         items = soup.find_all('div', class_='grid__item postcard')
         logging.info(f"Found {len(items)} elements with class 'grid__item postcard'.")
     except Exception as e:
         logging.error(f"Error: {e}")
+        return
     finally:
         driver.quit()
 
     data = []
     for item in items:
         try:
-            link_tag = item.find('a', href=True)
-            link = link_tag['href'] if link_tag else None
-            title = item.find('h2', class_='card__title').get_text(strip=True) if item.find('h2',
-                                                                                            class_='card__title') \
-                else "No Title"
+            link = extract_data(item, tag='a', attribute='href', default=None)
+            title = extract_data(item, tag='h2', class_='card__title', default="No title")
 
             if not link:
                 logging.warning(f"No link found for item: {title}")
                 continue
 
-            logging.info(f"Processing: {title}")
+            logging.info(f"Fetching details for: {title}")
 
+            # Загружаем HTML-страницу детали
             detail_html = fetch_page(link, headers=None)
             if not detail_html:
                 logging.warning(f"Failed to fetch details for {title}.")
                 continue
+
             detail_soup = BeautifulSoup(detail_html, 'html.parser')
 
-            # Извлечение других данных
-            description_tag = detail_soup.find('div', class_='entry-content')
-            description = description_tag.get_text(strip=True) if description_tag else "No description"
+            # Извлекаем необходимые данные
+            data.append({
+                'title': title,
+                'description': extract_data(detail_soup, tag='div', class_='entry-content', default="No description"),
+                'duration': extract_data(detail_soup, tag='h5', text='Duration of residency', find_next=True),
+                'accommodation': extract_data(detail_soup, tag='h5', text='Accommodation', find_next=True),
+                'disciplines': extract_data(detail_soup, tag='h5', text='Disciplines, work equipment and assistance',
+                                            find_next=True),
+                'studio': extract_data(detail_soup, tag='h5', text='Studio / Workspace', find_next=True),
+                'fees': extract_data(detail_soup, tag='h5', text='Fees and support', find_next=True),
+                'expectations': extract_data(detail_soup, tag='h5', text='Expectations towards the artist',
+                                             find_next=True),
+                'application_info': extract_data(detail_soup, tag='h5', text='Application information', find_next=True),
+                'application_deadline': extract_data(detail_soup, tag='h5', text='Application deadline',
+                                                     find_next=True),
+                'residency_starts': extract_data(detail_soup, tag='h5', text='Residency starts', find_next=True),
+                'residency_ends': extract_data(detail_soup, tag='h5', text='Residency ends', find_next=True),
+                'location': extract_data(detail_soup, tag='h5', text='Location', find_next=True),
+                'more_info_link': extract_data(detail_soup, tag='h5', text='Link to more information', find_next=False,
+                                               attribute='href'),
+            })
 
-            deadline_tag = item.find('dt')
-            deadline = deadline_tag.get_text(strip=True).replace('Deadline: ', '') if deadline_tag else "No deadline"
-            country = deadline.split('Country: ')[1] if 'Country: ' in deadline else ''
-            deadline = deadline.split('Country: ')[0] if 'Country: ' in deadline else deadline
-            duration_tag = detail_soup.find('h5', text='Duration of residency')
-            duration = duration_tag.find_next('span').get_text(strip=True) if duration_tag else "No duration"
-
-            accommodation_tag = detail_soup.find('h5', text='Accommodation')
-            accommodation = accommodation_tag.find_next('span').get_text(
-                strip=True) if accommodation_tag else "No accommodation"
-
-            disciplines_tag = detail_soup.find('h5', text='Disciplines, work equipment and assistance')
-            disciplines = disciplines_tag.find_next('span').get_text(
-                strip=True) if disciplines_tag else "No disciplines"
-
-            studio_tag = detail_soup.find('h5', text='Studio / Workspace')
-            studio = studio_tag.find_next('span').get_text(strip=True) if studio_tag else "No studio"
-
-            fees_tag = detail_soup.find('h5', text='Fees and support')
-            fees = fees_tag.find_next('span').get_text(strip=True) if fees_tag else "No fees"
-
-            expectations_tag = detail_soup.find('h5', text='Expectations towards the artist')
-            expectations = expectations_tag.find_next('span').get_text(
-                strip=True) if expectations_tag else "No expectations"
-
-            application_info_tag = detail_soup.find('h5', text='Application information')
-            application_info = application_info_tag.find_next('span').get_text(
-                strip=True) if application_info_tag else "No application info"
-
-            application_deadline_tag = detail_soup.find('h5', text='Application deadline')
-            application_deadline = application_deadline_tag.find_next('span').get_text(
-                strip=True) if application_deadline_tag else "No application deadline"
-
-            residency_starts_tag = detail_soup.find('h5', text='Residency starts')
-            residency_starts = residency_starts_tag.find_next('span').get_text(
-                strip=True) if residency_starts_tag else "No residency starts"
-
-            residency_ends_tag = detail_soup.find('h5', text='Residency ends')
-            residency_ends = residency_ends_tag.find_next('span').get_text(
-                strip=True) if residency_ends_tag else "No residency ends"
-
-            location_tag = detail_soup.find('h5', text='Location')
-            location = location_tag.find_next('span').get_text(strip=True) if location_tag else "No location"
-
-            more_info_tag = detail_soup.find('h5', text='Link to more information')
-            more_info_link = more_info_tag.find_next('a', href=True)['href'] if more_info_tag else "No more info link"
-
-            data.append(
-                [title, description, deadline, country, duration, accommodation, disciplines, studio, fees, application_info,
-                application_deadline, residency_starts, residency_ends, location, more_info_link])
+            logging.info(f"Successfully processed: {title}")
             sleep(1)  # Задержка между запросами
         except Exception as e:
-            logging.error(f"Error processing item: {e}")
+            logging.error(f"Error processing item {title if 'title' in locals() else 'Unknown'}: {e}")
             continue
-
-    save_to_csv(output_file, data, ['Title', 'Description', 'Deadline', 'Country', 'Duration', 'Accommodation',
-                                    'Disciplines', 'Studio', 'Fees', 'Application_info', 'Application_Deadline', 'Residency starts',
-                                    'Residency ends', 'Location', 'More_info_link'
-                                    ])
-    logging.info(f"Saved ResArtis data to {output_file}")
 
 
 def parse_curatorspace_opportunities(base_url, output_file):
@@ -368,10 +474,10 @@ def parse_curatorspace_opportunities(base_url, output_file):
 
         for opp in opportunities:
             try:
-                title = safe_get_text(opp, 'h4', 'media-heading')
-                deadline = safe_get_text(opp, 'strong').replace('Deadline: ', '')
-                location_info = safe_get_text(opp, 'p', 'details')
-                short_description = safe_get_text(opp, 'p', 'description')
+                title = extract_data(opp, tag='h4', class_='media-heading')
+                deadline = extract_data(opp, tag='strong').replace('Deadline: ', '')
+                location_info = extract_data(opp, tag='p', class_='details')
+                short_description = extract_data(opp, tag='p', class_='description')
                 link = "https://www.curatorspace.com" + opp.find('a', class_='btn-sm btn btn-info')['href']
 
                 data.append([title, deadline, location_info, short_description, link])
@@ -497,5 +603,9 @@ def parse_artists_communities(base_url, output_file):
 
 
 if __name__ == "__main__":
-    # main()
-    parse_csv_file('curatorspace_calls.csv')
+    main()
+    # parse_csv_file('/content/drive/MyDrive/curatorspace_calls.csv')
+    # добавляем больше файлов для дополнительного парсинга
+    # main_process(
+    #    '/content/drive/MyDrive/open_calls_ready_2',
+    # )
